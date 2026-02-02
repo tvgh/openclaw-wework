@@ -1,0 +1,11 @@
+{
+  "id": "workweixin",
+  "channels": [
+    "workweixin"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "clawd-gateway-wework",
+  "version": "0.3.0",
+  "description": "WorkWeixin (Enterprise WeChat) channel plugin for Clawdbot",
+  "type": "module",
+  "main": "index.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nicewang/clawd-gateway-wework.git"
+  },
+  "keywords": [
+    "clawdbot",
+    "workweixin",
+    "wechat",
+    "enterprise-wechat",
+    "wecom",
+    "channel-plugin"
+  ],
+  "author": "",
+  "license": "MIT",
+  "peerDependencies": {
+    "clawdbot": ">=2026.1.0"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^4.0.0"
+  },
+  "clawdbot": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
