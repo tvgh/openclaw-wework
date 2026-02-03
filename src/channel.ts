@@ -4,8 +4,18 @@ import {
 } from "clawdbot/plugin-sdk";
 
 import { getWorkWeixinRuntime } from "./runtime.js";
+import {
+  connectionPool,
+  requestCache,
+  rateLimiter,
+  circuitBreaker,
+  messageQueue,
+  getInfrastructureStatus,
+  type QueueStatus,
+} from "./infrastructure/index.js";
 
 const meta = getChatChannelMeta("workweixin");
+const WORKWEIXIN_API_BASE = "https://qyapi.weixin.qq.com";
 
 // WorkWeixin account config interface
 interface WorkWeixinAccountConfig {
@@ -85,43 +95,102 @@ function listWorkWeixinAccountIds(cfg: any): string[] {
   return ids;
 }
 
-// WeChat Work API helper
+// WeChat Work API helper - 带缓存的Token获取
 async function getAccessToken(corpId: string, corpSecret: string): Promise<string> {
-  const url = `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${corpId}&corpsecret=${corpSecret}`;
-  const response = await fetch(url);
-  const data = await response.json() as { errcode?: number; access_token?: string; errmsg?: string };
+  const cacheKey = requestCache.generateKey("GET", "/cgi-bin/gettoken", { corpId });
+
+  // 尝试从缓存获取
+  const cached = requestCache.get(cacheKey) as { accessToken: string; expiresIn: number } | null;
+  if (cached) {
+    return cached.accessToken;
+  }
+
+  const url = `${WORKWEIXIN_API_BASE}/cgi-bin/gettoken?corpid=${encodeURIComponent(corpId)}&corpsecret=${encodeURIComponent(corpSecret)}`;
+  const response = await connectionPool.request(url, { method: "GET" });
+  const data = await response.json() as { errcode?: number; access_token?: string; expires_in?: number; errmsg?: string };
 
   if (data.errcode !== 0) {
     throw new Error(`Failed to get access token: ${data.errmsg}`);
   }
-  return data.access_token!;
+
+  const result = {
+    accessToken: data.access_token!,
+    expiresIn: data.expires_in!,
+  };
+
+  // 缓存access_token (缓存时间比过期时间短120秒)
+  const ttl = (data.expires_in! - 120) * 1000;
+  requestCache.set(cacheKey, result, ttl);
+
+  return result.accessToken;
 }
 
 async function sendWorkWeixinMessage(
   toUser: string,
   content: string,
-  config: WorkWeixinAccountConfig
+  config: WorkWeixinAccountConfig,
+  options: { accountId?: string; useQueue?: boolean } = {}
 ): Promise<{ success: boolean; msgid?: string }> {
-  const token = await getAccessToken(config.corpId!, config.corpSecret!);
-  const url = `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${token}`;
+  const accountId = options.accountId ?? "default";
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      touser: toUser,
-      msgtype: "text",
-      agentid: config.agentId,
-      text: { content },
-    }),
-  });
-
-  const data = await response.json() as { errcode?: number; msgid?: string; errmsg?: string };
-  if (data.errcode !== 0) {
-    throw new Error(`Failed to send message: ${data.errmsg}`);
+  // 检查限流
+  const rateCheck = await rateLimiter.check(accountId);
+  if (!rateCheck.allowed) {
+    if (rateCheck.waitTime && rateCheck.waitTime > 0) {
+      await new Promise((resolve) => setTimeout(resolve, rateCheck.waitTime));
+    }
   }
 
-  return { success: true, msgid: data.msgid };
+  // 使用断路器保护的发送逻辑
+  return circuitBreaker.execute(async () => {
+    const token = await getAccessToken(config.corpId!, config.corpSecret!);
+    const url = `${WORKWEIXIN_API_BASE}/cgi-bin/message/send?access_token=${encodeURIComponent(token)}`;
+
+    const response = await connectionPool.request(url, {
+      method: "POST",
+      body: JSON.stringify({
+        touser: toUser,
+        msgtype: "text",
+        agentid: config.agentId,
+        text: { content },
+      }),
+    });
+
+    const data = (await response.json()) as {
+      errcode?: number;
+      msgid?: string;
+      errmsg?: string;
+    };
+
+    if (data.errcode !== 0) {
+      throw new Error(`Failed to send message: ${data.errmsg}`);
+    }
+
+    return { success: true, msgid: data.msgid };
+  });
+}
+
+/**
+ * 发送消息（通过消息队列，带重试机制）
+ */
+async function sendWorkWeixinMessageQueued(
+  toUser: string,
+  content: string,
+  config: WorkWeixinAccountConfig,
+  accountId: string = "default"
+): Promise<string> {
+  return messageQueue.add({ toUser, content, config, accountId }, async (msg) => {
+    await sendWorkWeixinMessage(msg.toUser, msg.content, msg.config, {
+      accountId: msg.accountId,
+    });
+  });
+}
+
+/**
+ * 获取基础设施状态
+ */
+function getWorkWeixinInfraStatus() {
+  return getInfrastructureStatus();
 }
 
 export const workWeixinPlugin: ChannelPlugin<ResolvedWorkWeixinAccount> = {
@@ -288,7 +357,9 @@ export const workWeixinPlugin: ChannelPlugin<ResolvedWorkWeixinAccount> = {
     textChunkLimit: 2000,
     sendText: async ({ to, text, accountId, cfg }) => {
       const account = resolveWorkWeixinAccount(cfg, accountId ?? "default");
-      const result = await sendWorkWeixinMessage(to, text, account.config);
+      const result = await sendWorkWeixinMessage(to, text, account.config, {
+        accountId: accountId ?? "default",
+      });
       return { channel: "workweixin", ...result };
     },
     sendMedia: async () => {
@@ -297,14 +368,51 @@ export const workWeixinPlugin: ChannelPlugin<ResolvedWorkWeixinAccount> = {
   },
   status: {
     defaultRuntime: { accountId: "default", running: false, lastStartAt: null, lastStopAt: null, lastError: null },
-    collectStatusIssues: () => [],
+    collectStatusIssues: () => {
+      const issues: Array<{ level: string; message: string }> = [];
+      const infraStatus = getWorkWeixinInfraStatus();
+
+      // 检查断路器状态
+      if (infraStatus.circuitBreaker.state === "open") {
+        issues.push({
+          level: "error",
+          message: "Circuit breaker is open - API calls are blocked",
+        });
+      } else if (infraStatus.circuitBreaker.state === "half-open") {
+        issues.push({
+          level: "warning",
+          message: "Circuit breaker is recovering",
+        });
+      }
+
+      // 检查消息队列积压
+      if (infraStatus.messageQueue.pending > 100) {
+        issues.push({
+          level: "warning",
+          message: `Message queue backlog: ${infraStatus.messageQueue.pending} pending`,
+        });
+      }
+
+      // 检查失败消息
+      if (infraStatus.messageQueue.failedCount > 0) {
+        issues.push({
+          level: "warning",
+          message: `${infraStatus.messageQueue.failedCount} failed messages in queue`,
+        });
+      }
+
+      return issues;
+    },
     buildChannelSummary: ({ snapshot }) => ({
       configured: snapshot.configured ?? false,
       running: snapshot.running ?? false,
     }),
     probeAccount: async ({ account }) => {
       try {
-        await getAccessToken(account.config.corpId!, account.config.corpSecret!);
+        // 使用断路器保护的探测
+        await circuitBreaker.execute(async () => {
+          await getAccessToken(account.config.corpId!, account.config.corpSecret!);
+        });
         return { ok: true };
       } catch (e) {
         return { ok: false, error: String(e) };
@@ -318,6 +426,7 @@ export const workWeixinPlugin: ChannelPlugin<ResolvedWorkWeixinAccount> = {
       configured: Boolean(account.config.corpId?.trim()) && Boolean(account.config.corpSecret?.trim()),
       running: runtime?.running ?? false,
       probe,
+      infrastructure: getWorkWeixinInfraStatus(),
     }),
   },
   gateway: {
