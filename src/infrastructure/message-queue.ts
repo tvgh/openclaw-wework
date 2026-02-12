@@ -15,6 +15,7 @@ export interface QueueItem<T> {
 export interface FailedItem<T> {
   id: string;
   message: T;
+  sendFn: (msg: T) => Promise<void>;
   error: string;
   failedAt: number;
   retries: number;
@@ -145,6 +146,7 @@ export class MessageQueue<T = unknown> {
         this.failed.push({
           id: item.id,
           message,
+          sendFn,
           error: err instanceof Error ? err.message : String(err),
           failedAt: Date.now(),
           retries: item.retries,
@@ -181,9 +183,20 @@ export class MessageQueue<T = unknown> {
     let retried = 0;
 
     for (const item of items) {
-      // 注意：重试时需要提供 sendFn，这里只是简单放回队列
-      // 实际使用时应该在添加时保存 sendFn 或使用默认发送函数
+      this.queue.push({
+        id: this.generateId(),
+        message: item.message,
+        sendFn: item.sendFn,
+        retries: 0,
+        addedAt: Date.now(),
+      });
+      this.stats.total++;
       retried++;
+    }
+
+    // Trigger processing if items were added
+    if (retried > 0) {
+      this.process().catch(() => {});
     }
 
     return retried;

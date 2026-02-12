@@ -4,6 +4,7 @@
  */
 
 // Connection Pool
+import { HttpConnectionPool } from "./connection-pool.js";
 export {
   HttpConnectionPool,
   connectionPool,
@@ -14,6 +15,7 @@ export {
 } from "./connection-pool.js";
 
 // Request Cache
+import { RequestCache } from "./request-cache.js";
 export {
   RequestCache,
   requestCache,
@@ -23,6 +25,7 @@ export {
 } from "./request-cache.js";
 
 // Rate Limiter
+import { RateLimiter } from "./rate-limiter.js";
 export {
   RateLimiter,
   rateLimiter,
@@ -32,6 +35,7 @@ export {
 } from "./rate-limiter.js";
 
 // Circuit Breaker
+import { CircuitBreaker } from "./circuit-breaker.js";
 export {
   CircuitBreaker,
   CircuitBreakerOpenError,
@@ -42,6 +46,7 @@ export {
 } from "./circuit-breaker.js";
 
 // Message Queue
+import { MessageQueue } from "./message-queue.js";
 export {
   MessageQueue,
   messageQueue,
@@ -62,12 +67,6 @@ export function createInfrastructure(options?: {
   circuitBreaker?: import("./circuit-breaker.js").CircuitBreakerOptions;
   messageQueue?: import("./message-queue.js").MessageQueueOptions;
 }) {
-  const { HttpConnectionPool } = require("./connection-pool.js");
-  const { RequestCache } = require("./request-cache.js");
-  const { RateLimiter } = require("./rate-limiter.js");
-  const { CircuitBreaker } = require("./circuit-breaker.js");
-  const { MessageQueue } = require("./message-queue.js");
-
   return {
     connectionPool: new HttpConnectionPool(options?.connectionPool),
     requestCache: new RequestCache(options?.requestCache),
